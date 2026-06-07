@@ -36,4 +36,4 @@ service-account.json
 .idea/
 
 service.json
-colab_whisper_server.ipynb
+# colab_whisper_server.ipynb
