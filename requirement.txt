@@ -1,19 +1,19 @@
-# Core API
+# ── Web framework ──────────────────────────────────────────────
 fastapi==0.136.3
 uvicorn==0.49.0
-python-multipart==0.0.32
+python-multipart==0.0.32          # multipart/form-data (audio upload)
 
-# HTTP client (forwarding to Colab Whisper)
-requests==2.34.2
+# ── STT + Translation  (mirrors Django requirements exactly) ────
+SpeechRecognition==3.10.4         # Google Speech Recognition (ml-IN), free, no API key
+deep-translator==1.11.4           # Google Translate (ml → en), no API key
 
-# Config
+# ── Config ──────────────────────────────────────────────────────
 python-dotenv==1.2.2
 
-# FastAPI internals (pinned for compatibility)
+# ── FastAPI internals (pinned) ───────────────────────────────────
 starlette==1.2.1
 pydantic==2.13.4
 pydantic_core==2.46.4
 anyio==4.13.0
 httptools==0.8.0
 watchfiles==1.2.0
-websockets==16.0

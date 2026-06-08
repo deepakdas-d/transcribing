@@ -1,13 +1,28 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+"""
+main.py — Audio Transcription & Translation Service
+
+Endpoints:
+  GET  /                         — health check
+  POST /transcribe               — audio → Malayalam text  (Google Speech ml-IN)
+  POST /transcribe-and-translate — audio → Malayalam + English translation
+"""
+
+from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import tempfile
-import requests
-import os
+
+from audio_processor import run_pipeline
 
 load_dotenv()
 
-app = FastAPI(title="Whisper Transcription API", version="1.0.0")
+app = FastAPI(
+    title="Transcription & Translation API",
+    description=(
+        "Upload audio → Malayalam via Google Speech Recognition (ml-IN), "
+        "optional Malayalam→English via Google Translate."
+    ),
+    version="2.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,89 +31,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-COLAB_WHISPER_URL = os.getenv("COLAB_WHISPER_URL")
 
-if not COLAB_WHISPER_URL:
-    raise Exception("COLAB_WHISPER_URL missing from .env")
+# ─────────────────────────────────────────────
+# Health
+# ─────────────────────────────────────────────
 
-SUPPORTED_FORMATS = {".wav", ".mp3", ".mp4", ".webm", ".ogg", ".m4a", ".flac"}
-
-
-@app.get("/")
+@app.get("/", tags=["health"])
 def health():
     return {
         "status": "ok",
-        "whisper_server": COLAB_WHISPER_URL,
-        "engine": "whisper-large-v3",
+        "stt_engine": "google-speech-recognition",
+        "stt_language": "ml-IN",
+        "translation": "deep-translator (Google)",
     }
 
 
-@app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
+# ─────────────────────────────────────────────
+# POST /transcribe
+# Audio → Malayalam text only
+# ─────────────────────────────────────────────
+
+@app.post("/transcribe", status_code=status.HTTP_200_OK, tags=["pipeline"])
+async def transcribe_only(file: UploadFile = File(...)):
     """
-    Upload an audio file and receive a Malayalam transcription from Whisper.
-    Supported formats: wav, mp3, mp4, webm, ogg, m4a, flac
+    Upload audio, receive Malayalam transcription only.
+
+    FormData:
+        file — audio blob (wav / mp3 / mp4 / webm / ogg / m4a / flac)
+
+    Response 200:
+        { "success": true, "filename": "...", "malayalam": "..." }
+
+    Response 400:
+        { "detail": "Speech not clear..." | "Google Speech API error: ..." }
     """
-    suffix = (
-        os.path.splitext(file.filename)[1].lower()
-        if file.filename
-        else ".wav"
-    )
+    audio_bytes = await file.read()
+    result = run_pipeline(audio_bytes, filename=file.filename or "audio.webm", translate=False)
 
-    if suffix not in SUPPORTED_FORMATS:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported format '{suffix}'. Supported: {', '.join(SUPPORTED_FORMATS)}",
-        )
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["error"])
 
-    temp_path = None
+    return {
+        "success"  : True,
+        "filename" : file.filename,
+        "malayalam": result["malayalam"],
+    }
 
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            temp_path = tmp.name
 
-        with open(temp_path, "rb") as audio_file:
-            response = requests.post(
-                f"{COLAB_WHISPER_URL}/transcribe",
-                files={"file": (file.filename, audio_file, file.content_type)},
-                timeout=1800,
-            )
+# ─────────────────────────────────────────────
+# POST /transcribe-and-translate
+# Audio → Malayalam + English
+# ─────────────────────────────────────────────
 
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=response.text,
-            )
+@app.post("/transcribe-and-translate", status_code=status.HTTP_200_OK, tags=["pipeline"])
+async def transcribe_and_translate(file: UploadFile = File(...)):
+    """
+    Upload audio, receive Malayalam transcription AND English translation.
 
-        result = response.json()
+    FormData:
+        file — audio blob (wav / mp3 / mp4 / webm / ogg / m4a / flac)
 
-        return {
-            "success": True,
-            "engine": "whisper-large-v3",
-            "source": COLAB_WHISPER_URL,
-            "filename": file.filename,
-            "result": result,
+    Response 200:
+        {
+            "success"  : true,
+            "filename" : "...",
+            "malayalam": "...",
+            "english"  : "..."   ← empty string if translation failed (non-fatal)
         }
 
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Whisper server timed out")
+    Response 400:
+        { "detail": "Speech not clear..." | "Google Speech API error: ..." }
+    """
+    audio_bytes = await file.read()
+    result = run_pipeline(audio_bytes, filename=file.filename or "audio.webm", translate=True)
 
-    except HTTPException:
-        raise
+    # Hard failure (STT failed) — return 400
+    if not result["success"] and not result["malayalam"]:
+        raise HTTPException(status_code=400, detail=result["error"])
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "success"  : True,
+        "filename" : file.filename,
+        "malayalam": result["malayalam"],
+        "english"  : result["english"],
+        # Surface translation error in response if it happened but was non-fatal
+        **({"translation_error": result["error"]} if result["error"] else {}),
+    }
 
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
 
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
