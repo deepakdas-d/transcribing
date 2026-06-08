@@ -3,8 +3,8 @@ main.py — Audio Transcription, Translation & Medical Extraction Service
 
 Endpoints:
   GET  /                              — health check
-  POST /transcribe                    — audio → Malayalam text  (Google Speech ml-IN)
-  POST /transcribe-and-translate      — audio → Malayalam + English translation
+  POST /transcribe                    — audio → Malayalam text  (Groq Whisper ml)
+  POST /transcribe-and-translate      — audio → Malayalam + structured English (Groq Whisper + LLaMA)
   POST /transcribe-and-extract        — audio → Malayalam + English + MedicalExtraction (Ollama)
 """
 
@@ -12,18 +12,19 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from audio_processor import run_pipeline, COLAB_BASE_URL, OLLAMA_MODEL
+from audio_processor import run_pipeline, COLAB_BASE_URL, OLLAMA_MODEL, GROQ_WHISPER_MODEL, GROQ_LLAMA_MODEL
 
 load_dotenv()
 
 app = FastAPI(
     title="Transcription, Translation & Medical Extraction API",
     description=(
-        "Upload audio → Malayalam via Google Speech Recognition (ml-IN), "
-        "optional Malayalam→English via Google Translate, "
+        "Upload audio → Malayalam via Groq Whisper large-v3 (ml), "
+        "Malayalam→English via Groq Whisper translation mode, "
+        "LLaMA 70B cross-check & clinical note structuring, "
         "optional structured medical extraction via remote Ollama (Colab)."
     ),
-    version="3.0.0",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -41,12 +42,13 @@ app.add_middleware(
 @app.get("/", tags=["health"])
 def health():
     return {
-        "status"        : "ok",
-        "version"       : "3.0.0",
-        "stt_engine"    : "google-speech-recognition",
-        "stt_language"  : "ml-IN",
-        "translation"   : "deep-translator (Google)",
-        "extraction"    : f"Ollama {OLLAMA_MODEL} via {COLAB_BASE_URL}",
+        "status"         : "ok",
+        "version"        : "4.0.0",
+        "stt_engine"     : f"groq-{GROQ_WHISPER_MODEL}",
+        "stt_language"   : "ml (Malayalam)",
+        "translation"    : f"groq-{GROQ_WHISPER_MODEL} (translate mode)",
+        "correction"     : f"groq-{GROQ_LLAMA_MODEL} (cross-check + structuring)",
+        "extraction"     : f"Ollama {OLLAMA_MODEL} via {COLAB_BASE_URL}",
     }
 
 
@@ -67,7 +69,7 @@ async def transcribe_only(file: UploadFile = File(...)):
         { "success": true, "filename": "...", "malayalam": "..." }
 
     Response 400:
-        { "detail": "Speech not clear..." | "Google Speech API error: ..." }
+        { "detail": "No speech detected..." | "Groq API error: ..." }
     """
     audio_bytes = await file.read()
     result = run_pipeline(
@@ -89,13 +91,14 @@ async def transcribe_only(file: UploadFile = File(...)):
 
 # ─────────────────────────────────────────────
 # POST /transcribe-and-translate
-# Audio → Malayalam + English
+# Audio → Malayalam + structured English clinical note
 # ─────────────────────────────────────────────
 
 @app.post("/transcribe-and-translate", status_code=status.HTTP_200_OK, tags=["pipeline"])
 async def transcribe_and_translate(file: UploadFile = File(...)):
     """
-    Upload audio, receive Malayalam transcription AND English translation.
+    Upload audio, receive Malayalam transcription AND LLaMA-corrected English
+    structured clinical note.
 
     FormData:
         file — audio blob (wav / mp3 / mp4 / webm / ogg / m4a / flac)
@@ -105,11 +108,11 @@ async def transcribe_and_translate(file: UploadFile = File(...)):
             "success"  : true,
             "filename" : "...",
             "malayalam": "...",
-            "english"  : "..."
+            "english"  : "Chief Complaint: ...\\nTreatment Done: ...\\n..."
         }
 
     Response 400:
-        { "detail": "Speech not clear..." | "Google Speech API error: ..." }
+        { "detail": "No speech detected..." | "Groq API error: ..." }
     """
     audio_bytes = await file.read()
     result = run_pipeline(
@@ -127,7 +130,7 @@ async def transcribe_and_translate(file: UploadFile = File(...)):
         "filename" : file.filename,
         "malayalam": result["malayalam"],
         "english"  : result["english"],
-        **({"translation_error": result["error"]} if result["error"] else {}),
+        **({"pipeline_error": result["error"]} if result["error"] else {}),
     }
 
 
@@ -139,8 +142,8 @@ async def transcribe_and_translate(file: UploadFile = File(...)):
 @app.post("/transcribe-and-extract", status_code=status.HTTP_200_OK, tags=["pipeline"])
 async def transcribe_and_extract(file: UploadFile = File(...)):
     """
-    Upload audio, receive Malayalam transcription, English translation,
-    AND a fully structured MedicalExtraction object from remote Ollama.
+    Upload audio, receive Malayalam transcription, LLaMA-corrected English clinical
+    note, AND a fully structured MedicalExtraction object from remote Ollama.
 
     FormData:
         file — audio blob (wav / mp3 / mp4 / webm / ogg / m4a / flac)
@@ -176,10 +179,9 @@ async def transcribe_and_extract(file: UploadFile = File(...)):
         }
 
     Response 400:
-        { "detail": "Speech not clear..." | "Google Speech API error: ..." }
+        { "detail": "No speech detected..." | "Groq API error: ..." }
 
     Notes:
-        - Translation failure is non-fatal; extraction proceeds with Malayalam text.
         - Extraction failure is non-fatal; extraction field will be null with an
           "extraction_error" key explaining what went wrong.
     """
@@ -203,14 +205,11 @@ async def transcribe_and_extract(file: UploadFile = File(...)):
         "extraction": result["extraction"],   # None if Ollama call failed
     }
 
-    # Surface non-fatal errors (translation / extraction) without breaking 200
+    # Surface non-fatal errors (extraction) without breaking 200
     if result["error"]:
-        # Split combined error string back into individual keys for clarity
         errors = [e.strip() for e in result["error"].split("|") if e.strip()]
         for err in errors:
-            if err.lower().startswith("translation"):
-                response["translation_error"] = err
-            elif err.lower().startswith("could not") or "ollama" in err.lower() or "extraction" in err.lower():
+            if "ollama" in err.lower() or "extraction" in err.lower() or "colab" in err.lower():
                 response["extraction_error"] = err
             else:
                 response["pipeline_error"] = err
